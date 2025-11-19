@@ -2,7 +2,7 @@
 import faulthandler
 import logging
 import os
-from typing import Callable
+from typing import Callable, List
 
 import httpx
 from a2a.server.apps import A2AFastAPIApplication
@@ -14,6 +14,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from google.adk.agents import BaseAgent
 from google.adk.apps import App
+from google.adk.artifacts import InMemoryArtifactService
+from google.adk.plugins import BasePlugin
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
@@ -24,19 +26,6 @@ from ._agent_executor import A2aAgentExecutor
 from ._session_service import KAgentSessionService
 from ._token import KAgentTokenService
 
-
-# --- Configure Logging ---
-def configure_logging() -> None:
-    """Configure logging based on LOG_LEVEL environment variable."""
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    numeric_level = getattr(logging, log_level, logging.INFO)
-    logging.basicConfig(
-        level=numeric_level,
-    )
-    logging.info(f"Logging configured with level: {log_level}")
-
-
-configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -64,11 +53,13 @@ class KAgentApp:
         agent_card: AgentCard,
         kagent_url: str,
         app_name: str,
+        plugins: List[BasePlugin] = None,
     ):
         self.root_agent = root_agent
         self.kagent_url = kagent_url
         self.app_name = app_name
         self.agent_card = agent_card
+        self.plugins = plugins if plugins is not None else []
 
     def build(self) -> FastAPI:
         token_service = KAgentTokenService(self.app_name)
@@ -77,17 +68,17 @@ class KAgentApp:
         )
         session_service = KAgentSessionService(http_client)
 
-        plugins = []
         if sts_well_known_uri:
             sts_integration = ADKSTSIntegration(sts_well_known_uri)
-            plugins.append(ADKTokenPropagationPlugin(sts_integration))
+            self.plugins.append(ADKTokenPropagationPlugin(sts_integration))
 
-        adk_app = App(name=self.app_name, root_agent=self.root_agent, plugins=plugins)
+        adk_app = App(name=self.app_name, root_agent=self.root_agent, plugins=self.plugins)
 
         def create_runner() -> Runner:
             return Runner(
                 app=adk_app,
                 session_service=session_service,
+                artifact_service=InMemoryArtifactService(),
             )
 
         agent_executor = A2aAgentExecutor(
@@ -126,6 +117,7 @@ class KAgentApp:
                 agent=self.root_agent,
                 app_name=self.app_name,
                 session_service=session_service,
+                artifact_service=InMemoryArtifactService(),
             )
 
         agent_executor = A2aAgentExecutor(
@@ -173,6 +165,7 @@ class KAgentApp:
             agent=root_agent,
             app_name=self.app_name,
             session_service=session_service,
+            artifact_service=InMemoryArtifactService(),
         )
 
         logger.info(f"\n>>> User Query: {task}")

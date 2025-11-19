@@ -40,6 +40,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Initialize Environment
+        uses: ./.github/actions/initialize-environment
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
@@ -80,7 +82,7 @@ jobs:
           make create-kind-cluster
           echo "Cache key: ${{ needs.setup.outputs.cache-key }}"
           make helm-install
-          make push-test-agent
+          make push-test-agent push-test-skill
           kubectl wait --for=condition=Ready  agents.kagent.dev -n kagent --all --timeout=60s || kubectl get po -n kagent -o wide ||:
           kubectl wait --for=condition=Ready  agents.kagent.dev -n kagent --all --timeout=60s
 
@@ -261,6 +263,10 @@ jobs:
         working-directory: ./python
         run: |
           uv sync --all-extras
+
+      - name: Generate test certificates
+        working-directory: ./python
+        run: make generate-test-certs
 
       - name: Run tests
         working-directory: ./python

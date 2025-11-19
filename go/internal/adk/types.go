@@ -40,6 +40,11 @@ type BaseModel struct {
 	Type    string            `json:"type"`
 	Model   string            `json:"model"`
 	Headers map[string]string `json:"headers,omitempty"`
+
+	// TLS/SSL configuration (applies to all model types)
+	TLSDisableVerify    *bool   `json:"tls_disable_verify,omitempty"`
+	TLSCACertPath       *string `json:"tls_ca_cert_path,omitempty"`
+	TLSDisableSystemCAs *bool   `json:"tls_disable_system_cas,omitempty"`
 }
 
 type OpenAI struct {
@@ -239,6 +244,7 @@ type RemoteAgentConfig struct {
 	Description string            `json:"description,omitempty"`
 }
 
+// See `python/packages/kagent-adk/src/kagent/adk/types.py` for the python version of this
 type AgentConfig struct {
 	Model        Model                 `json:"model"`
 	Description  string                `json:"description"`
@@ -246,6 +252,7 @@ type AgentConfig struct {
 	HttpTools    []HttpMcpServerConfig `json:"http_tools"`
 	SseTools     []SseMcpServerConfig  `json:"sse_tools"`
 	RemoteAgents []RemoteAgentConfig   `json:"remote_agents"`
+	ExecuteCode  bool                  `json:"execute_code,omitempty"`
 }
 
 func (a *AgentConfig) UnmarshalJSON(data []byte) error {

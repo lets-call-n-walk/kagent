@@ -45,8 +45,6 @@ interface ModelParam {
   value: string;
 }
 
-// Helper function to process parameters before submission
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const processModelParams = (requiredParams: ModelParam[], optionalParams: ModelParam[]): Record<string, any> => {
   const allParams = [...requiredParams, ...optionalParams]
@@ -177,7 +175,7 @@ function ModelPageContent() {
     const fetchModelData = async () => {
       if (isEditMode && modelConfigName && providers.length > 0 && providerModelsData) {
         try {
-          if (!isLoading) setIsLoading(true);
+          setIsLoading(true);
           const response = await getModelConfig(
             k8sRefUtils.toRef(modelConfigNamespace || '', modelConfigName)
           );
@@ -260,7 +258,6 @@ function ModelPageContent() {
     if (selectedProvider) {
       const requiredKeys = selectedProvider.requiredParams || [];
       const optionalKeys = selectedProvider.optionalParams || [];
-
       const currentModelRequiresReset = !isEditMode;
 
       if (currentModelRequiresReset) {
@@ -610,3 +607,8 @@ export default function ModelPage() {
     </React.Suspense>
   );
 }
+
+
+
+
+

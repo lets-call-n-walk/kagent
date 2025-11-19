@@ -326,13 +326,58 @@ func (a *adkApiTranslator) buildManifest(
 		},
 		corev1.EnvVar{
 			Name:  "KAGENT_URL",
-			Value: fmt.Sprintf("http://kagent-controller.%s:8083", utils.GetResourceNamespace()),
+			Value: fmt.Sprintf("http://%s.%s:8083", utils.GetControllerName(), utils.GetResourceNamespace()),
 		},
 	)
+
+	var skills []string
+	if agent.Spec.Skills != nil && len(agent.Spec.Skills.Refs) != 0 {
+		skills = agent.Spec.Skills.Refs
+	}
 
 	// Build Deployment
 	volumes := append(secretVol, dep.Volumes...)
 	volumeMounts := append(secretMounts, dep.VolumeMounts...)
+	needSandbox := cfg != nil && cfg.ExecuteCode
+
+	var initContainers []corev1.Container
+
+	if len(skills) > 0 {
+		skillsEnv := corev1.EnvVar{
+			Name:  "KAGENT_SKILLS_FOLDER",
+			Value: "/skills",
+		}
+		needSandbox = true
+		insecure := agent.Spec.Skills.InsecureSkipVerify
+		command := []string{"kagent-adk", "pull-skills"}
+		if insecure {
+			command = append(command, "--insecure")
+		}
+		initContainers = append(initContainers, corev1.Container{
+			Name:    "skills-init",
+			Image:   dep.Image,
+			Command: command,
+			Args:    skills,
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "kagent-skills", MountPath: "/skills"},
+			},
+			Env: []corev1.EnvVar{
+				skillsEnv,
+			},
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: "kagent-skills",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "kagent-skills",
+			MountPath: "/skills",
+			ReadOnly:  true,
+		})
+		sharedEnv = append(sharedEnv, skillsEnv)
+	}
 
 	// Token volume
 	volumes = append(volumes, corev1.Volume{
@@ -368,6 +413,12 @@ func (a *adkApiTranslator) buildManifest(
 	}
 	// Add config hash annotation to pod template to force rollout on config changes
 	podTemplateAnnotations["kagent.dev/config-hash"] = fmt.Sprintf("%d", configHash)
+	var securityContext *corev1.SecurityContext
+	if needSandbox {
+		securityContext = &corev1.SecurityContext{
+			Privileged: ptr.To(true),
+		}
+	}
 
 	deployment := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -387,6 +438,7 @@ func (a *adkApiTranslator) buildManifest(
 				Spec: corev1.PodSpec{
 					ServiceAccountName: agent.Name,
 					ImagePullSecrets:   dep.ImagePullSecrets,
+					InitContainers:     initContainers,
 					Containers: []corev1.Container{{
 						Name:            "kagent",
 						Image:           dep.Image,
@@ -404,9 +456,13 @@ func (a *adkApiTranslator) buildManifest(
 							TimeoutSeconds:      15,
 							PeriodSeconds:       15,
 						},
-						VolumeMounts: volumeMounts,
+						SecurityContext: securityContext,
+						VolumeMounts:    volumeMounts,
 					}},
-					Volumes: volumes,
+					Volumes:      volumes,
+					Tolerations:  dep.Tolerations,
+					Affinity:     dep.Affinity,
+					NodeSelector: dep.NodeSelector,
 				},
 			},
 		},
@@ -460,6 +516,7 @@ func (a *adkApiTranslator) translateInlineAgent(ctx context.Context, agent *v1al
 		Description: agent.Spec.Description,
 		Instruction: systemMessage,
 		Model:       model,
+		ExecuteCode: ptr.Deref(agent.Spec.Declarative.ExecuteCodeBlocks, false),
 	}
 	agentCard := &server.AgentCard{
 		Name:        strings.ReplaceAll(agent.Name, "-", "_"),
@@ -545,7 +602,58 @@ func (a *adkApiTranslator) resolveSystemMessage(ctx context.Context, agent *v1al
 
 const (
 	googleCredsVolumeName = "google-creds"
+	tlsCACertVolumeName   = "tls-ca-cert"
+	tlsCACertMountPath    = "/etc/ssl/certs/custom"
 )
+
+// populateTLSFields populates TLS configuration fields in the BaseModel
+// from the ModelConfig TLS spec.
+func populateTLSFields(baseModel *adk.BaseModel, tlsConfig *v1alpha2.TLSConfig) {
+	if tlsConfig == nil {
+		return
+	}
+
+	// Set TLS configuration fields in BaseModel
+	baseModel.TLSDisableVerify = &tlsConfig.DisableVerify
+	baseModel.TLSDisableSystemCAs = &tlsConfig.DisableSystemCAs
+
+	// Set CA cert path if Secret and key are both specified
+	if tlsConfig.CACertSecretRef != "" && tlsConfig.CACertSecretKey != "" {
+		certPath := fmt.Sprintf("%s/%s", tlsCACertMountPath, tlsConfig.CACertSecretKey)
+		baseModel.TLSCACertPath = &certPath
+	}
+}
+
+// addTLSConfiguration adds TLS certificate volume mounts to modelDeploymentData
+// when TLS configuration is present in the ModelConfig.
+// Note: TLS configuration fields are now included in agent config JSON via BaseModel,
+// so this function only handles volume mounting.
+func addTLSConfiguration(modelDeploymentData *modelDeploymentData, tlsConfig *v1alpha2.TLSConfig) {
+	if tlsConfig == nil {
+		return
+	}
+
+	// Add Secret volume mount if both CA certificate Secret and key are specified
+	if tlsConfig.CACertSecretRef != "" && tlsConfig.CACertSecretKey != "" {
+		// Add volume from Secret
+		modelDeploymentData.Volumes = append(modelDeploymentData.Volumes, corev1.Volume{
+			Name: tlsCACertVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  tlsConfig.CACertSecretRef,
+					DefaultMode: ptr.To(int32(0444)), // Read-only for all users
+				},
+			},
+		})
+
+		// Add volume mount
+		modelDeploymentData.VolumeMounts = append(modelDeploymentData.VolumeMounts, corev1.VolumeMount{
+			Name:      tlsCACertVolumeName,
+			MountPath: tlsCACertMountPath,
+			ReadOnly:  true,
+		})
+	}
+}
 
 func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelConfig string) (adk.Model, *modelDeploymentData, error) {
 	model := &v1alpha2.ModelConfig{}
@@ -555,6 +663,9 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 	}
 
 	modelDeploymentData := &modelDeploymentData{}
+
+	// Add TLS configuration if present
+	addTLSConfiguration(modelDeploymentData, model.Spec.TLS)
 
 	switch model.Spec.Provider {
 	case v1alpha2.ModelProviderOpenAI:
@@ -577,6 +688,9 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 				Headers: model.Spec.DefaultHeaders,
 			},
 		}
+		// Populate TLS fields in BaseModel
+		populateTLSFields(&openai.BaseModel, model.Spec.TLS)
+
 		if model.Spec.OpenAI != nil {
 			openai.BaseUrl = model.Spec.OpenAI.BaseURL
 			openai.Temperature = utils.ParseStringToFloat64(model.Spec.OpenAI.Temperature)
@@ -629,6 +743,9 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 				Headers: model.Spec.DefaultHeaders,
 			},
 		}
+		// Populate TLS fields in BaseModel
+		populateTLSFields(&anthropic.BaseModel, model.Spec.TLS)
+
 		if model.Spec.Anthropic != nil {
 			anthropic.BaseUrl = model.Spec.Anthropic.BaseURL
 		}
@@ -672,6 +789,9 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 				Headers: model.Spec.DefaultHeaders,
 			},
 		}
+		// Populate TLS fields in BaseModel
+		populateTLSFields(&azureOpenAI.BaseModel, model.Spec.TLS)
+
 		return azureOpenAI, modelDeploymentData, nil
 	case v1alpha2.ModelProviderGeminiVertexAI:
 		if model.Spec.GeminiVertexAI == nil {
@@ -713,6 +833,9 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 				Headers: model.Spec.DefaultHeaders,
 			},
 		}
+		// Populate TLS fields in BaseModel
+		populateTLSFields(&gemini.BaseModel, model.Spec.TLS)
+
 		return gemini, modelDeploymentData, nil
 	case v1alpha2.ModelProviderAnthropicVertexAI:
 		if model.Spec.AnthropicVertexAI == nil {
@@ -750,6 +873,9 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 				Headers: model.Spec.DefaultHeaders,
 			},
 		}
+		// Populate TLS fields in BaseModel
+		populateTLSFields(&anthropic.BaseModel, model.Spec.TLS)
+
 		return anthropic, modelDeploymentData, nil
 	case v1alpha2.ModelProviderOllama:
 		if model.Spec.Ollama == nil {
@@ -765,6 +891,9 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 				Headers: model.Spec.DefaultHeaders,
 			},
 		}
+		// Populate TLS fields in BaseModel
+		populateTLSFields(&ollama.BaseModel, model.Spec.TLS)
+
 		return ollama, modelDeploymentData, nil
 	case v1alpha2.ModelProviderGemini:
 		modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
@@ -784,6 +913,9 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 				Headers: model.Spec.DefaultHeaders,
 			},
 		}
+		// Populate TLS fields in BaseModel
+		populateTLSFields(&gemini.BaseModel, model.Spec.TLS)
+
 		return gemini, modelDeploymentData, nil
 	}
 	return nil, nil, fmt.Errorf("unknown model provider: %s", model.Spec.Provider)
@@ -1052,6 +1184,9 @@ type resolvedDeployment struct {
 	Annotations      map[string]string
 	Env              []corev1.EnvVar
 	Resources        corev1.ResourceRequirements
+	Tolerations      []corev1.Toleration
+	Affinity         *corev1.Affinity
+	NodeSelector     map[string]string
 }
 
 // getDefaultResources sets default resource requirements if not specified
@@ -1084,9 +1219,7 @@ func getDefaultLabels(agentName string, incoming map[string]string) map[string]s
 func (a *adkApiTranslator) resolveInlineDeployment(agent *v1alpha2.Agent, mdd *modelDeploymentData) (*resolvedDeployment, error) {
 	// Defaults
 	port := int32(8080)
-	cmd := "kagent-adk"
 	args := []string{
-		"static",
 		"--host",
 		"0.0.0.0",
 		"--port",
@@ -1122,7 +1255,6 @@ func (a *adkApiTranslator) resolveInlineDeployment(agent *v1alpha2.Agent, mdd *m
 
 	dep := &resolvedDeployment{
 		Image:            image,
-		Cmd:              cmd,
 		Args:             args,
 		Port:             port,
 		ImagePullPolicy:  imagePullPolicy,
@@ -1134,11 +1266,9 @@ func (a *adkApiTranslator) resolveInlineDeployment(agent *v1alpha2.Agent, mdd *m
 		Annotations:      maps.Clone(spec.Annotations),
 		Env:              append(slices.Clone(spec.Env), mdd.EnvVars...),
 		Resources:        getDefaultResources(spec.Resources), // Set default resources if not specified
-	}
-
-	// Set default replicas if not specified
-	if dep.Replicas == nil {
-		dep.Replicas = ptr.To(int32(1))
+		Tolerations:      slices.Clone(spec.Tolerations),
+		Affinity:         spec.Affinity,
+		NodeSelector:     maps.Clone(spec.NodeSelector),
 	}
 
 	return dep, nil
@@ -1204,6 +1334,9 @@ func (a *adkApiTranslator) resolveByoDeployment(agent *v1alpha2.Agent) (*resolve
 		Annotations:      maps.Clone(spec.Annotations),
 		Env:              slices.Clone(spec.Env),
 		Resources:        getDefaultResources(spec.Resources), // Set default resources if not specified
+		Tolerations:      slices.Clone(spec.Tolerations),
+		Affinity:         spec.Affinity,
+		NodeSelector:     maps.Clone(spec.NodeSelector),
 	}
 
 	return dep, nil
